@@ -13,6 +13,8 @@ shadowbroker:
             runAsGroup: 1001
           image:
             pullPolicy: Always
+            # GHCR (primary, public, auto-built on every push to main).
+            # GitLab fallback: registry.gitlab.com/bigbodycobain/shadowbroker/backend (requires auth + currently no CI builds it).
             repository: ghcr.io/bigbodycobain/shadowbroker-backend
             tag: latest
           env:
@@ -41,6 +43,8 @@ shadowbroker:
             runAsGroup: 1001
           image:
             pullPolicy: Always
+            # GHCR (primary, public, auto-built on every push to main).
+            # GitLab fallback: registry.gitlab.com/bigbodycobain/shadowbroker/frontend (requires auth + currently no CI builds it).
             repository: ghcr.io/bigbodycobain/shadowbroker-frontend
             tag: latest
 

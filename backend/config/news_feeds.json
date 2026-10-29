@@ -7,7 +7,7 @@
     },
     {
       "name": "BBC",
-      "url": "http://feeds.bbci.co.uk/news/world/rss.xml",
+      "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
       "weight": 3
     },
     {
@@ -26,29 +26,39 @@
       "weight": 5
     },
     {
-      "name": "NHK",
-      "url": "https://www3.nhk.or.jp/nhkworld/rss/world.xml",
+      "name": "The War Zone",
+      "url": "https://www.twz.com/feed",
+      "weight": 4
+    },
+    {
+      "name": "Bellingcat",
+      "url": "https://www.bellingcat.com/feed/",
+      "weight": 4
+    },
+    {
+      "name": "Guardian",
+      "url": "https://www.theguardian.com/world/rss",
       "weight": 3
     },
     {
+      "name": "TASS",
+      "url": "https://tass.com/rss/v2.xml",
+      "weight": 2
+    },
+    {
+      "name": "Xinhua",
+      "url": "https://www.news.cn/english/rss/worldrss.xml",
+      "weight": 2
+    },
+    {
       "name": "CNA",
-      "url": "https://www.channelnewsasia.com/rssfeed/8395986",
+      "url": "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml",
       "weight": 3
     },
     {
       "name": "Mercopress",
       "url": "https://en.mercopress.com/rss/",
       "weight": 3
-    },
-    {
-      "name": "FocusTaiwan",
-      "url": "https://focustaiwan.tw/rss",
-      "weight": 5
-    },
-    {
-      "name": "Kyodo",
-      "url": "https://english.kyodonews.net/rss/news.xml",
-      "weight": 4
     },
     {
       "name": "SCMP",
@@ -61,23 +71,8 @@
       "weight": 4
     },
     {
-      "name": "Stars and Stripes",
-      "url": "https://www.stripes.com/feeds/pacific.rss",
-      "weight": 4
-    },
-    {
       "name": "Yonhap",
       "url": "https://en.yna.co.kr/RSS/news.xml",
-      "weight": 4
-    },
-    {
-      "name": "Nikkei Asia",
-      "url": "https://asia.nikkei.com/rss",
-      "weight": 3
-    },
-    {
-      "name": "Taipei Times",
-      "url": "https://www.taipeitimes.com/xml/pda.rss",
       "weight": 4
     },
     {
@@ -94,6 +89,26 @@
       "name": "Japan Times",
       "url": "https://www.japantimes.co.jp/feed/",
       "weight": 3
+    },
+    {
+      "name": "CSM",
+      "url": "https://www.csmonitor.com/rss/world",
+      "weight": 4
+    },
+    {
+      "name": "PBS NewsHour",
+      "url": "https://www.pbs.org/newshour/feeds/rss/world",
+      "weight": 4
+    },
+    {
+      "name": "France 24",
+      "url": "https://www.france24.com/en/rss",
+      "weight": 4
+    },
+    {
+      "name": "DW",
+      "url": "https://rss.dw.com/xml/rss-en-world",
+      "weight": 4
     }
   ]
 }

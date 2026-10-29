@@ -1,170 +1,409 @@
-"use client";
+'use client';
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
-import { motion } from "framer-motion";
-import { ChevronLeft, ChevronRight } from "lucide-react";
-import WorldviewLeftPanel from "@/components/WorldviewLeftPanel";
+import { motion } from '@/lib/motion';
+import { ChevronLeft, ChevronRight, ChevronUp, ChevronDown } from 'lucide-react';
+import WorldviewLeftPanel from '@/components/WorldviewLeftPanel';
 
-import NewsFeed from "@/components/NewsFeed";
-import MarketsPanel from "@/components/MarketsPanel";
-import FilterPanel from "@/components/FilterPanel";
-import FindLocateBar from "@/components/FindLocateBar";
-import TopRightControls from "@/components/TopRightControls";
-import RadioInterceptPanel from "@/components/RadioInterceptPanel";
-import SettingsPanel from "@/components/SettingsPanel";
-import MapLegend from "@/components/MapLegend";
-import ScaleBar from "@/components/ScaleBar";
-import ErrorBoundary from "@/components/ErrorBoundary";
-import { DashboardDataProvider } from "@/lib/DashboardDataContext";
-import OnboardingModal, { useOnboarding } from "@/components/OnboardingModal";
-import ChangelogModal, { useChangelog } from "@/components/ChangelogModal";
-import type { SelectedEntity } from "@/types/dashboard";
-import { NOMINATIM_DEBOUNCE_MS } from "@/lib/constants";
-import { useDataPolling } from "@/hooks/useDataPolling";
-import { useReverseGeocode } from "@/hooks/useReverseGeocode";
-import { useRegionDossier } from "@/hooks/useRegionDossier";
+import NewsFeed from '@/components/NewsFeed';
+import MarketsPanel from '@/components/MarketsPanel';
+import FilterPanel from '@/components/FilterPanel';
+import FindLocateBar from '@/components/FindLocateBar';
+import TopRightControls from '@/components/TopRightControls';
+import TimelinePanel from '@/components/TimelinePanel';
+import MapLegend from '@/components/MapLegend';
+import ScaleBar from '@/components/ScaleBar';
+import MeshChat from '@/components/MeshChat';
+import { endInfonetTerminalSession } from '@/lib/infonetTerminalSession';
+import { requestInfonetLeave } from '@/lib/infonetLeaveNotice';
+import InfonetLeaveConfirm from '@/components/InfonetLeaveConfirm';
+import ShodanPanel from '@/components/ShodanPanel';
+import ReconPanel from '@/components/ReconPanel';
+import ScmPanel from '@/components/ScmPanel';
+import CyberThreatPanel from '@/components/CyberThreatPanel';
+import EntityGraphPanel from '@/components/EntityGraphPanel';
+import { isEntityGraphEligible } from '@/lib/entityGraph';
+import AIIntelPanel from '@/components/AIIntelPanel';
+import GlobalTicker from '@/components/GlobalTicker';
+import ErrorBoundary from '@/components/ErrorBoundary';
+import OnboardingModal, { useOnboarding } from '@/components/OnboardingModal';
+import ChangelogModal, { markChangelogSeen, useChangelog } from '@/components/ChangelogModal';
+import StartupWarmupModal, { useStartupWarmupNotice } from '@/components/StartupWarmupModal';
+import type { ActiveLayers, KiwiSDR, Scanner, SelectedEntity } from '@/types/dashboard';
+import {
+  getDefaultActiveLayers,
+  getDefaultMapStyle,
+  loadActiveFilters,
+  loadActiveLayers,
+  loadMapStyle,
+  saveActiveFilters,
+  saveActiveLayers,
+  saveMapStyle,
+  type MapStyle,
+} from '@/lib/layerPreferences';
+import type { ShodanSearchMatch } from '@/types/shodan';
+import { API_BASE } from '@/lib/api';
+import { useDataPolling, LAYER_TOGGLE_EVENT } from '@/hooks/useDataPolling';
+import { useBackendStatus, useDataKey, useDataKeys } from '@/hooks/useDataStore';
+import { useReverseGeocode } from '@/hooks/useReverseGeocode';
+import { useRegionDossier } from '@/hooks/useRegionDossier';
+import { useGtDossier } from '@/hooks/useGtDossier';
+import { useAgentActions } from '@/hooks/useAgentActions';
+import { useFeedHealth } from '@/hooks/useFeedHealth';
+import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import KeyboardShortcutsOverlay from '@/components/KeyboardShortcutsOverlay';
+import AlertToast from '@/components/AlertToast';
+import AisUpstreamBanner from '@/components/AisUpstreamBanner';
+import { useAlertToasts } from '@/hooks/useAlertToasts';
+import { useWatchlist } from '@/hooks/useWatchlist';
+import WatchlistWidget from '@/components/WatchlistWidget';
+import {
+  requestSecureMeshTerminalLauncherOpen,
+  subscribeMeshTerminalOpen,
+} from '@/lib/meshTerminalLauncher';
+import {
+  hasSentinelInfoBeenSeen,
+  markSentinelInfoSeen,
+  hasSentinelCredentials,
+  checkBackendSentinelStatus,
+} from '@/lib/sentinelHub';
+import { useTranslation } from '@/i18n';
+import { LocateBar } from './LocateBar';
+import { SentinelInfoModal } from './SentinelInfoModal';
+import SarAoiEditorModal from '@/components/SarAoiEditorModal';
 
 // Use dynamic loads for Maplibre to avoid SSR window is not defined errors
 const MaplibreViewer = dynamic(() => import('@/components/MaplibreViewer'), { ssr: false });
+// Heavy panels — defer until opened so they stay out of the critical path
+const SettingsPanel = dynamic(() => import('@/components/SettingsPanel'), { ssr: false });
+const MeshTerminal = dynamic(() => import('@/components/MeshTerminal'), { ssr: false });
+const InfonetTerminal = dynamic(() => import('@/components/InfonetTerminal'), { ssr: false });
 
-/* ── LOCATE BAR ── coordinate / place-name search above bottom status bar ── */
-function LocateBar({ onLocate }: { onLocate: (lat: number, lng: number) => void }) {
-  const [open, setOpen] = useState(false);
-  const [value, setValue] = useState('');
-  const [results, setResults] = useState<{ label: string; lat: number; lng: number }[]>([]);
-  const [loading, setLoading] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => { if (open) inputRef.current?.focus(); }, [open]);
-
-  // Parse raw coordinate input: "31.8, 34.8" or "31.8 34.8" or "-12.3, 45.6"
-  const parseCoords = (s: string): { lat: number; lng: number } | null => {
-    const m = s.trim().match(/^([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)$/);
-    if (!m) return null;
-    const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
-    if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) return { lat, lng };
-    return null;
-  };
-
-  const handleSearch = async (q: string) => {
-    setValue(q);
-    // Check for raw coordinates first
-    const coords = parseCoords(q);
-    if (coords) {
-      setResults([{ label: `${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}`, ...coords }]);
-      return;
-    }
-    // Geocode with Nominatim (debounced)
-    if (timerRef.current) clearTimeout(timerRef.current);
-    if (q.trim().length < 2) { setResults([]); return; }
-    timerRef.current = setTimeout(async () => {
-      setLoading(true);
-      try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5`, {
-          headers: { 'Accept-Language': 'en' },
-        });
-        const data = await res.json();
-        setResults(data.map((r: { display_name: string; lat: string; lon: string }) => ({ label: r.display_name, lat: parseFloat(r.lat), lng: parseFloat(r.lon) })));
-      } catch { setResults([]); }
-      setLoading(false);
-    }, NOMINATIM_DEBOUNCE_MS);
-  };
-
-  const handleSelect = (r: { lat: number; lng: number }) => {
-    onLocate(r.lat, r.lng);
-    setOpen(false);
-    setValue('');
-    setResults([]);
-  };
-
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="flex items-center gap-1.5 bg-[var(--bg-primary)]/60 backdrop-blur-md border border-[var(--border-primary)] rounded-lg px-3 py-1.5 text-[9px] font-mono tracking-[0.15em] text-[var(--text-muted)] hover:text-cyan-400 hover:border-cyan-800 transition-colors"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-        LOCATE
-      </button>
-    );
-  }
-
-  return (
-    <div className="relative w-[420px]">
-      <div className="flex items-center gap-2 bg-[var(--bg-primary)]/80 backdrop-blur-md border border-cyan-800/60 rounded-lg px-3 py-2 shadow-[0_0_20px_rgba(0,255,255,0.1)]">
-        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-cyan-500 flex-shrink-0"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-        <input
-          ref={inputRef}
-          value={value}
-          onChange={(e) => handleSearch(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Escape') { setOpen(false); setValue(''); setResults([]); } if (e.key === 'Enter' && results.length > 0) handleSelect(results[0]); }}
-          placeholder="Enter coordinates (31.8, 34.8) or place name..."
-          className="flex-1 bg-transparent text-[10px] text-[var(--text-primary)] font-mono tracking-wider outline-none placeholder:text-[var(--text-muted)]"
-        />
-        {loading && <div className="w-3 h-3 border border-cyan-500 border-t-transparent rounded-full animate-spin" />}
-        <button onClick={() => { setOpen(false); setValue(''); setResults([]); }} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
-          <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-        </button>
-      </div>
-      {results.length > 0 && (
-        <div className="absolute bottom-full left-0 right-0 mb-1 bg-[var(--bg-secondary)]/95 backdrop-blur-md border border-[var(--border-primary)] rounded-lg overflow-hidden shadow-[0_-8px_30px_rgba(0,0,0,0.4)] max-h-[200px] overflow-y-auto styled-scrollbar">
-          {results.map((r, i) => (
-            <button key={i} onClick={() => handleSelect(r)} className="w-full text-left px-3 py-2 hover:bg-cyan-950/40 transition-colors border-b border-[var(--border-primary)]/50 last:border-0 flex items-center gap-2">
-              <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-cyan-500 flex-shrink-0"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>
-              <span className="text-[9px] text-[var(--text-secondary)] font-mono truncate">{r.label}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
+// LocateBar and SentinelInfoModal extracted to page-local modules (Sprint 4B)
 
 export default function Dashboard() {
-  const { data, dataVersion, backendStatus } = useDataPolling();
+  const viewBoundsRef = useRef<{ south: number; west: number; north: number; east: number } | null>(null);
+  const { t } = useTranslation();
+  // Start the critical map data request before panel/control-plane effects.
+  // Non-map widgets can warm up after this; first paint needs flights, ships, and intel first.
+  useDataPolling();
   const { mouseCoords, locationLabel, handleMouseCoords } = useReverseGeocode();
   const [selectedEntity, setSelectedEntity] = useState<SelectedEntity | null>(null);
-  const [trackedSdr, setTrackedSdr] = useState<any>(null);
-  const { regionDossier, regionDossierLoading, handleMapRightClick } = useRegionDossier(selectedEntity, setSelectedEntity);
+  const [showEntityGraph, setShowEntityGraph] = useState(false);
+  useEffect(() => {
+    setShowEntityGraph(false);
+  }, [selectedEntity]);
+  const [trackedSdr, setTrackedSdr] = useState<KiwiSDR | null>(null);
+  const [trackedScanner, setTrackedScanner] = useState<Scanner | null>(null);
+  const { regionDossier, regionDossierLoading, handleMapRightClick } = useRegionDossier(
+    selectedEntity,
+    setSelectedEntity,
+  );
+
+  // Agent can push satellite imagery to the same full-screen viewer as right-click,
+  // and can fly the map to a point (e.g. sar_focus_aoi).  The hook is invoked
+  // below — after setFlyToLocation is declared — so the fly_to callback can
+  // close over it without hitting a temporal dead zone.
 
   const [uiVisible, setUiVisible] = useState(true);
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
+  const [tickerOpen, setTickerOpen] = useState(true);
+
+  // Persist UI panel states
+  useEffect(() => {
+    const l = localStorage.getItem('sb_left_open');
+    const r = localStorage.getItem('sb_right_open');
+    const tk = localStorage.getItem('sb_ticker_open');
+    if (l !== null) setLeftOpen(l === 'true');
+    if (r !== null) setRightOpen(r === 'true');
+    if (tk !== null) setTickerOpen(tk === 'true');
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('sb_left_open', leftOpen.toString());
+  }, [leftOpen]);
+
+  useEffect(() => {
+    localStorage.setItem('sb_right_open', rightOpen.toString());
+  }, [rightOpen]);
+
+  useEffect(() => {
+    localStorage.setItem('sb_ticker_open', tickerOpen.toString());
+  }, [tickerOpen]);
+
+  // Issue #298: kick the one-time backend Sentinel-status check on mount.
+  // This populates the cached value that ``hasSentinelCredentials()`` reads
+  // synchronously elsewhere (MaplibreViewer's tile-URL memo, the
+  // Sentinel-info modal flow). Fire-and-forget — the cache stays false
+  // until resolved so the UI fails safely.
+  useEffect(() => {
+    void checkBackendSentinelStatus();
+  }, []);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [legendOpen, setLegendOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalLaunchToken, setTerminalLaunchToken] = useState(0);
+  const [infonetOpen, setInfonetOpen] = useState(false);
+  const [meshChatLaunchRequest, setMeshChatLaunchRequest] = useState<{
+    tab: 'infonet' | 'meshtastic' | 'dms';
+    gate?: string;
+    peerId?: string;
+    showSas?: boolean;
+    nonce: number;
+  } | null>(null);
+  const [dmCount, setDmCount] = useState(0);
   const [mapView, setMapView] = useState({ zoom: 2, latitude: 20 });
+  const [locateBarOpen, setLocateBarOpen] = useState(false);
   const [measureMode, setMeasureMode] = useState(false);
   const [measurePoints, setMeasurePoints] = useState<{ lat: number; lng: number }[]>([]);
+  const [pinPlacementMode, setPinPlacementMode] = useState(false);
 
-  const [activeLayers, setActiveLayers] = useState({
-    flights: true,
-    private: true,
-    jets: true,
-    military: true,
-    tracked: true,
-    satellites: true,
-    ships_military: true,
-    ships_cargo: true,
-    ships_civilian: false,
-    ships_passenger: true,
-    ships_tracked_yachts: true,
-    earthquakes: true,
-    cctv: false,
-    ukraine_frontline: true,
-    global_incidents: true,
-    day_night: true,
-    gps_jamming: true,
-    gibs_imagery: false,
-    highres_satellite: false,
-    kiwisdr: false,
-    firms: false,
-    internet_outages: false,
-    datacenters: false,
-    military_bases: false,
-    power_plants: false,
+  // SAR AOI editor + map drop mode
+  const [sarAoiEditorOpen, setSarAoiEditorOpen] = useState(false);
+  const [sarAoiDropMode, setSarAoiDropMode] = useState(false);
+  const [sarAoiDroppedCoords, setSarAoiDroppedCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const sarAoiListChangedRef = useRef(0);
+  const [sarAoiListVersion, setSarAoiListVersion] = useState(0);
+
+  const openMeshTerminal = useCallback(() => {
+    setTerminalOpen(true);
+    setTerminalLaunchToken((prev) => prev + 1);
+  }, []);
+
+  const openInfonet = useCallback(() => {
+    setInfonetOpen(true);
+  }, []);
+
+  const openSecureTerminalLauncher = useCallback(() => {
+    requestSecureMeshTerminalLauncherOpen('dashboard');
+  }, []);
+
+  useEffect(() => subscribeMeshTerminalOpen(openInfonet), [openInfonet]);
+
+  const closeInfonet = useCallback(() => {
+    requestInfonetLeave(() => {
+      setInfonetOpen(false);
+      void endInfonetTerminalSession();
+    });
+  }, []);
+
+  const toggleInfonet = useCallback(() => {
+    if (infonetOpen) {
+      closeInfonet();
+    } else {
+      setInfonetOpen(true);
+    }
+  }, [closeInfonet, infonetOpen]);
+
+  const [activeLayers, setActiveLayers] = useState<ActiveLayers>(getDefaultActiveLayers);
+  // Backend-driven layer overrides. Additive on top of activeLayers, never
+  // persisted and never pushed back — the operator's own toggles stay theirs.
+  const [layerOverrides, setLayerOverrides] = useState<Partial<ActiveLayers>>({});
+  const [activeStyle, setActiveStyle] = useState<MapStyle>(getDefaultMapStyle);
+  const [activeFilters, setActiveFilters] = useState<Record<string, string[]>>({});
+  const [layerPrefsHydrated, setLayerPrefsHydrated] = useState(false);
+
+  // SSR/hydration cannot read localStorage in useState — load saved UI prefs after mount.
+  useEffect(() => {
+    setActiveLayers(loadActiveLayers());
+    setActiveStyle(loadMapStyle());
+    setActiveFilters(loadActiveFilters());
+    setLayerPrefsHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!layerPrefsHydrated) return;
+    saveActiveLayers(activeLayers);
+  }, [activeLayers, layerPrefsHydrated]);
+
+  useEffect(() => {
+    if (!layerPrefsHydrated) return;
+    saveMapStyle(activeStyle);
+  }, [activeStyle, layerPrefsHydrated]);
+
+  useEffect(() => {
+    if (!layerPrefsHydrated) return;
+    saveActiveFilters(activeFilters);
+  }, [activeFilters, layerPrefsHydrated]);
+
+  const resetActiveLayers = useCallback(() => {
+    setActiveLayers(getDefaultActiveLayers());
+  }, []);
+  const enableLayers = useCallback((keys: (keyof ActiveLayers)[]) => {
+    setActiveLayers((prev) => {
+      const next = { ...prev };
+      for (const key of keys) next[key] = true;
+      return next;
+    });
+  }, []);
+  const regionLat =
+    selectedEntity?.type === 'region_dossier' ? selectedEntity.extra?.lat : undefined;
+  const regionLng =
+    selectedEntity?.type === 'region_dossier' ? selectedEntity.extra?.lng : undefined;
+  const { gtDossier, gtDossierLoading } = useGtDossier(
+    typeof regionLat === 'number' ? regionLat : undefined,
+    typeof regionLng === 'number' ? regionLng : undefined,
+    regionDossier?.country?.name,
+    activeLayers.gt_risk,
+  );
+  const [shodanResults, setShodanResults] = useState<ShodanSearchMatch[]>([]);
+  const [, setShodanQueryLabel] = useState('');
+  const [shodanStyle, setShodanStyle] = useState<import('@/types/shodan').ShodanStyleConfig>({ shape: 'circle', color: '#16a34a', size: 'md' });
+  const backendStatus = useBackendStatus();
+  const spaceWeather = useDataKey('space_weather');
+  const feedHealth = useFeedHealth();
+  const bootSignals = useDataKeys([
+    'bootstrap_ready',
+    'commercial_flights',
+    'military_flights',
+    'tracked_flights',
+    'ships',
+    'news',
+    'threat_level',
+  ] as const);
+  const criticalPaintReady = Boolean(
+    bootSignals.bootstrap_ready ||
+      (bootSignals.commercial_flights?.length || 0) > 0 ||
+      (bootSignals.military_flights?.length || 0) > 0 ||
+      (bootSignals.tracked_flights?.length || 0) > 0 ||
+      (bootSignals.ships?.length || 0) > 0 ||
+      (bootSignals.news?.length || 0) > 0 ||
+      bootSignals.threat_level,
+  );
+  const [secondaryBootReady, setSecondaryBootReady] = useState(false);
+
+  useEffect(() => {
+    if (secondaryBootReady) return;
+    const delay = criticalPaintReady ? 900 : 5500;
+    const id = window.setTimeout(() => setSecondaryBootReady(true), delay);
+    return () => window.clearTimeout(id);
+  }, [criticalPaintReady, secondaryBootReady]);
+
+  // Global keyboard shortcuts
+  useKeyboardShortcuts({
+    toggleLeft: () => setLeftOpen((p) => !p),
+    toggleRight: () => setRightOpen((p) => !p),
+    toggleMarkets: () => setTickerOpen((p) => !p),
+    openSettings: () => setSettingsOpen(true),
+    openLegend: () => setLegendOpen((p) => !p),
+    openShortcuts: () => setShortcutsOpen((p) => !p),
+    deselectEntity: () => {
+      if (shortcutsOpen) { setShortcutsOpen(false); return; }
+      if (settingsOpen) { setSettingsOpen(false); return; }
+      if (legendOpen) { setLegendOpen(false); return; }
+      setSelectedEntity(null);
+    },
+    focusSearch: () => {
+      const el = document.querySelector<HTMLInputElement>('[data-search-input]');
+      el?.focus();
+    },
   });
+
+  // Alert toast notifications for high-severity news
+  const { toasts, dismiss: dismissToast } = useAlertToasts();
+
+  // Persistent entity watchlist
+  const { items: watchlistItems, removeFromWatchlist, clearWatchlist } = useWatchlist();
+
+  // Notify backend of layer toggles so it can skip disabled fetchers / stop streams.
+  // After the POST completes, dispatch a custom event so useDataPolling immediately
+  // refetches slow-tier data — this makes toggled layers (power plants, GDELT, etc.)
+  // appear instantly instead of waiting up to 120 seconds.
+  const layersTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const initialLayerSyncRef = useRef(false);
+  useEffect(() => {
+    if (!secondaryBootReady || !layerPrefsHydrated) return;
+    const syncLayers = (triggerRefetch: boolean) =>
+      fetch(`${API_BASE}/api/layers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ layers: activeLayers }),
+      }).then(() => {
+        if (triggerRefetch) {
+          window.dispatchEvent(new Event(LAYER_TOGGLE_EVENT));
+        }
+      }).catch((e) => console.warn('Backend layer sync will retry after runtime is reachable:', e));
+
+    if (layersTimerRef.current) clearTimeout(layersTimerRef.current);
+    if (!initialLayerSyncRef.current) {
+      initialLayerSyncRef.current = true;
+      void syncLayers(false);
+    } else {
+      layersTimerRef.current = setTimeout(() => {
+        void syncLayers(true);
+      }, 250);
+    }
+    return () => {
+      if (layersTimerRef.current) clearTimeout(layersTimerRef.current);
+    };
+  }, [activeLayers, secondaryBootReady, layerPrefsHydrated]);
+
+  // Poll for backend layer overrides so an agent can switch an overlay on
+  // without the operator reloading. Overrides carry a TTL server-side, so a
+  // missed poll self-corrects and a dropped backend just lets them lapse.
+  useEffect(() => {
+    if (!secondaryBootReady) return;
+    let cancelled = false;
+    const pollOverrides = () =>
+      fetch(`${API_BASE}/api/layers`)
+        .then((r) => r.json())
+        .then((d) => {
+          if (!cancelled) setLayerOverrides(d?.overrides ?? {});
+        })
+        .catch(() => {});
+    void pollOverrides();
+    const id = setInterval(pollOverrides, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [secondaryBootReady]);
+
+  // Left panel accordion state
+  const [leftDataMinimized, setLeftDataMinimized] = useState(false);
+  const [leftMeshExpanded, setLeftMeshExpanded] = useState(true);
+  const [leftShodanMinimized, setLeftShodanMinimized] = useState(true);
+
+  const launchMeshChatTab = useCallback(
+    (
+      tab: 'infonet' | 'meshtastic' | 'dms',
+      gate?: string,
+      peerId?: string,
+      showSas?: boolean,
+    ) => {
+      setLeftOpen(true);
+      setLeftMeshExpanded(true);
+      setMeshChatLaunchRequest({ tab, gate, peerId, showSas, nonce: Date.now() });
+    },
+    [],
+  );
+
+  const openLiveGateFromShell = useCallback((gate: string) => {
+    setInfonetOpen(false);
+    launchMeshChatTab('infonet', gate);
+  }, [launchMeshChatTab]);
+
+  const openDeadDropFromShell = useCallback(
+    (peerId: string, options?: { showSas?: boolean }) => {
+      setInfonetOpen(false);
+      launchMeshChatTab('dms', undefined, peerId, Boolean(options?.showSas));
+    },
+    [launchMeshChatTab],
+  );
+
+  // Right panel: which panel is "focused" (expanded). null = none focused, all normal.
+  const [rightFocusedPanel, setRightFocusedPanel] = useState<string | null>(null);
+
+  // Auto-expand Data Layers when user starts tracking an SDR/Scanner
+  useEffect(() => {
+    if (trackedSdr || trackedScanner) {
+      setLeftDataMinimized(false);
+      setLeftOpen(true);
+    }
+  }, [trackedSdr, trackedScanner]);
 
   // NASA GIBS satellite imagery state
   const [gibsDate, setGibsDate] = useState<string>(() => {
@@ -174,338 +413,711 @@ export default function Dashboard() {
   });
   const [gibsOpacity, setGibsOpacity] = useState(0.6);
 
-  const [effects, setEffects] = useState({
+  // Sentinel Hub satellite imagery state (user-provided Copernicus CDSE credentials)
+  const [sentinelDate, setSentinelDate] = useState<string>(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 5); // Sentinel-2 has ~5-day revisit
+    return d.toISOString().slice(0, 10);
+  });
+  const [sentinelOpacity, setSentinelOpacity] = useState(0.6);
+  const [sentinelPreset, setSentinelPreset] = useState('TRUE-COLOR');
+  const [showSentinelInfo, setShowSentinelInfo] = useState(false);
+  const prevSentinelRef = useRef(false);
+
+  // Show info modal the first time sentinel_hub is toggled on
+  useEffect(() => {
+    if (activeLayers.sentinel_hub && !prevSentinelRef.current) {
+      if (!hasSentinelInfoBeenSeen()) {
+        setShowSentinelInfo(true);
+        markSentinelInfoSeen();
+      }
+      if (!hasSentinelCredentials()) {
+        // No creds — open settings instead
+        setSettingsOpen(true);
+      }
+    }
+    prevSentinelRef.current = activeLayers.sentinel_hub;
+  }, [activeLayers.sentinel_hub]);
+
+  const [effects] = useState({
     bloom: true,
   });
 
-  const [activeStyle, setActiveStyle] = useState('DEFAULT');
+  const memoizedEffects = useMemo(
+    () => ({ ...effects, bloom: effects.bloom && activeStyle !== 'DEFAULT', style: activeStyle }),
+    [effects, activeStyle],
+  );
+
+  const [flyToLocation, setFlyToLocation] = useState<{
+    lat: number;
+    lng: number;
+    zoom?: number;
+    bounds?: [number, number, number, number];
+    ts: number;
+  } | null>(null);
+
+  const handleFlyTo = useCallback(
+    (lat: number, lng: number) => setFlyToLocation({ lat, lng, ts: Date.now() }),
+    [],
+  );
+
+  const handleExpandEntityGraph = useCallback(() => {
+    if (isEntityGraphEligible(selectedEntity)) setShowEntityGraph(true);
+  }, [selectedEntity]);
+
+  const handleArticleClick = useCallback(
+    (idx: number, lat?: number, lng?: number, title?: string) => {
+      if (lat !== undefined && lng !== undefined) {
+        setFlyToLocation({ lat, lng, ts: Date.now() });
+        // Also highlight the corresponding map alert
+        if (title) {
+          const alertKey = `${title}|${lat},${lng}`;
+          setSelectedEntity({ id: alertKey, type: 'news' });
+        }
+      }
+    },
+    [],
+  );
+
+  const handleMeasureClick = useCallback(
+    (pt: { lat: number; lng: number }) => {
+      setMeasurePoints((prev) => (prev.length >= 3 ? prev : [...prev, pt]));
+    },
+    [],
+  );
+
   const stylesList = ['DEFAULT', 'SATELLITE'];
 
   const cycleStyle = () => {
     setActiveStyle((prev) => {
       const idx = stylesList.indexOf(prev);
-      const next = stylesList[(idx + 1) % stylesList.length];
+      const next = stylesList[(idx + 1) % stylesList.length] as MapStyle;
       // Auto-toggle High-Res Satellite layer with SATELLITE style
       setActiveLayers((l) => ({ ...l, highres_satellite: next === 'SATELLITE' }));
       return next;
     });
   };
 
-  const [activeFilters, setActiveFilters] = useState<Record<string, string[]>>({});
-  const [flyToLocation, setFlyToLocation] = useState<{ lat: number, lng: number, ts: number } | null>(null);
+  // Overrides merge last so they win over both the operator's toggles and the
+  // first-paint suppressions below.
+  const firstPaintActiveLayers = useMemo<ActiveLayers>(() => {
+    if (secondaryBootReady) return { ...activeLayers, ...layerOverrides };
+    return {
+      ...activeLayers,
+      cctv: false,
+      sar: false,
+      gibs_imagery: false,
+      highres_satellite: false,
+      sentinel_hub: false,
+      viirs_nightlights: false,
+      road_corridor_trends: false,
+      psk_reporter: false,
+      tinygs: false,
+      datacenters: false,
+      power_plants: false,
+      ...layerOverrides,
+    };
+  }, [activeLayers, layerOverrides, secondaryBootReady]);
+  // Agent fly_to handler (sar_focus_aoi etc.) — wired here now that
+  // setFlyToLocation is in scope.  show_image is routed through
+  // useAgentActions at the top of Dashboard.
+  useAgentActions(handleMapRightClick, ({ lat, lng, zoom }) => {
+    setFlyToLocation({ lat, lng, zoom, ts: Date.now() });
+  }, secondaryBootReady);
 
   // Eavesdrop Mode State
-  const [isEavesdropping, setIsEavesdropping] = useState(false);
-  const [eavesdropLocation, setEavesdropLocation] = useState<{ lat: number, lng: number } | null>(null);
-  const [cameraCenter, setCameraCenter] = useState<{ lat: number, lng: number } | null>(null);
+  const [isEavesdropping] = useState(false);
+  const [, setEavesdropLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [, setCameraCenter] = useState<{ lat: number; lng: number } | null>(null);
 
   // Onboarding & connection status
   const { showOnboarding, setShowOnboarding } = useOnboarding();
+  const { showWarmupNotice, setShowWarmupNotice } = useStartupWarmupNotice();
   const { showChangelog, setShowChangelog } = useChangelog();
 
   return (
-    <DashboardDataProvider data={data} selectedEntity={selectedEntity} setSelectedEntity={setSelectedEntity}>
-    <main className="fixed inset-0 w-full h-full bg-[var(--bg-primary)] overflow-hidden font-sans">
+    <>
+      <main className="fixed inset-0 w-full h-full bg-[var(--bg-primary)] overflow-hidden font-sans">
+        {/* MAPLIBRE WEBGL OVERLAY */}
+        <ErrorBoundary name="Map">
+          <MaplibreViewer
+            activeLayers={firstPaintActiveLayers}
+            activeFilters={activeFilters}
+            effects={memoizedEffects}
+            onEntityClick={setSelectedEntity}
+            selectedEntity={selectedEntity}
+            flyToLocation={flyToLocation}
+            gibsDate={gibsDate}
+            gibsOpacity={gibsOpacity}
+            sentinelDate={sentinelDate}
+            sentinelOpacity={sentinelOpacity}
+            sentinelPreset={sentinelPreset}
+            isEavesdropping={isEavesdropping}
+            onEavesdropClick={setEavesdropLocation}
+            onCameraMove={setCameraCenter}
+            onMouseCoords={handleMouseCoords}
+            onRightClick={handleMapRightClick}
+            regionDossier={regionDossier}
+            regionDossierLoading={regionDossierLoading}
+            onViewStateChange={setMapView}
+            measureMode={measureMode}
+            onMeasureClick={handleMeasureClick}
+            measurePoints={measurePoints}
+            viewBoundsRef={viewBoundsRef}
+            trackedSdr={trackedSdr}
+            setTrackedSdr={setTrackedSdr}
+            trackedScanner={trackedScanner}
+            setTrackedScanner={setTrackedScanner}
+            shodanResults={shodanResults}
+            shodanStyle={shodanStyle}
+            pinPlacementMode={pinPlacementMode}
+            onPinPlaced={() => setPinPlacementMode(false)}
+            sarAoiDropMode={sarAoiDropMode}
+            onSarAoiDropped={(coords) => {
+              setSarAoiDropMode(false);
+              setSarAoiDroppedCoords(coords);
+              setSarAoiEditorOpen(true);
+            }}
+            sarAoiListVersion={sarAoiListVersion}
+          />
+        </ErrorBoundary>
 
-      {/* MAPLIBRE WEBGL OVERLAY */}
-      <ErrorBoundary name="Map">
-        <MaplibreViewer
-          data={data}
-          activeLayers={activeLayers}
-          activeFilters={activeFilters}
-          effects={{ ...effects, bloom: effects.bloom && activeStyle !== 'DEFAULT', style: activeStyle }}
-          onEntityClick={setSelectedEntity}
-          selectedEntity={selectedEntity}
-          flyToLocation={flyToLocation}
-          gibsDate={gibsDate}
-          gibsOpacity={gibsOpacity}
-          isEavesdropping={isEavesdropping}
-          onEavesdropClick={setEavesdropLocation}
-          onCameraMove={setCameraCenter}
-          onMouseCoords={handleMouseCoords}
-          onRightClick={handleMapRightClick}
-          regionDossier={regionDossier}
-          regionDossierLoading={regionDossierLoading}
-          onViewStateChange={setMapView}
-          measureMode={measureMode}
-          onMeasureClick={(pt: { lat: number; lng: number }) => {
-            setMeasurePoints(prev => prev.length >= 3 ? prev : [...prev, pt]);
-          }}
-          measurePoints={measurePoints}
-          trackedSdr={trackedSdr}
-          setTrackedSdr={setTrackedSdr}
-        />
-      </ErrorBoundary>
-
-      {uiVisible && (
-        <>
-          {/* WORLDVIEW HEADER */}
-          <motion.div
-            initial={{ opacity: 0, y: -20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 1 }}
-            className="absolute top-6 left-6 z-[200] pointer-events-none flex items-center gap-4 hud-zone"
-          >
-            <div className="w-8 h-8 flex items-center justify-center">
-              {/* Target Reticle Icon */}
-              <div className="w-6 h-6 rounded-full border border-cyan-500 relative flex items-center justify-center">
-                <div className="w-4 h-4 rounded-full bg-cyan-500/30"></div>
-                <div className="absolute top-[-2px] bottom-[-2px] w-[1px] bg-cyan-500"></div>
-                <div className="absolute left-[-2px] right-[-2px] h-[1px] bg-cyan-500"></div>
+        {uiVisible && (
+          <>
+            {/* WORLDVIEW HEADER */}
+            <motion.div
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 1 }}
+              className="absolute top-6 left-6 z-[200] pointer-events-none flex items-center gap-4 hud-zone"
+            >
+              <div className="w-8 h-8 flex items-center justify-center">
+                {/* Target Reticle Icon */}
+                <div className="w-6 h-6 rounded-full border border-cyan-500 relative flex items-center justify-center">
+                  <div className="w-4 h-4 rounded-full bg-cyan-500/30"></div>
+                  <div className="absolute top-[-2px] bottom-[-2px] w-[1px] bg-cyan-500"></div>
+                  <div className="absolute left-[-2px] right-[-2px] h-[1px] bg-cyan-500"></div>
+                </div>
               </div>
+              <div className="flex flex-col">
+                <h1
+                  className="text-2xl font-bold tracking-[0.4em] text-[var(--text-primary)] flex items-center gap-3 text-glow"
+                  style={{ fontFamily: 'var(--font-roboto-mono), monospace' }}
+                >
+                  S H A D O W <span className="text-cyan-400">B R O K E R</span>
+                </h1>
+                <span className="text-[11px] text-[var(--text-muted)] font-mono tracking-[0.3em] mt-1 ml-1">
+                  {t('brand.subtitle')}
+                </span>
+              </div>
+            </motion.div>
+
+            {/* SYSTEM METRICS TOP LEFT */}
+            <div className="absolute top-2 left-6 text-[11px] font-mono tracking-widest text-cyan-500/50 z-[200] pointer-events-none hud-zone">
+              {t('brand.systemMetrics')}
             </div>
-            <div className="flex flex-col">
-              <h1 className="text-2xl font-bold tracking-[0.4em] text-[var(--text-primary)] flex items-center gap-3" style={{ fontFamily: 'monospace' }}>
-                S H A D O W <span className="text-cyan-400">B R O K E R</span>
-              </h1>
-              <span className="text-[9px] text-[var(--text-muted)] font-mono tracking-[0.3em] mt-1 ml-1">GLOBAL THREAT INTERCEPT</span>
-            </div>
-          </motion.div>
 
-          {/* SYSTEM METRICS TOP LEFT */}
-          <div className="absolute top-2 left-6 text-[8px] font-mono tracking-widest text-cyan-500/50 z-[200] pointer-events-none hud-zone">
-            OPTIC VIS:113  SRC:180  DENS:1.42  0.8ms
-          </div>
+            {/* SYSTEM METRICS TOP RIGHT — removed, label moved into TimelineScrubber */}
 
-          {/* SYSTEM METRICS TOP RIGHT */}
-          <div className="absolute top-2 right-6 text-[9px] flex flex-col items-end font-mono tracking-widest text-[var(--text-muted)] z-[200] pointer-events-none hud-zone">
-            <div>RTX</div>
-            <div>VSR</div>
-          </div>
-
-          {/* LEFT HUD CONTAINER — slides off left edge when hidden */}
-          <motion.div
-            className="absolute left-6 top-24 bottom-6 w-80 flex flex-col gap-6 z-[200] pointer-events-none hud-zone"
-            animate={{ x: leftOpen ? 0 : -360 }}
-            transition={{ type: 'spring', damping: 30, stiffness: 250 }}
-          >
-            {/* LEFT PANEL - DATA LAYERS */}
-            <ErrorBoundary name="WorldviewLeftPanel">
-              <WorldviewLeftPanel data={data} activeLayers={activeLayers} setActiveLayers={setActiveLayers} onSettingsClick={() => setSettingsOpen(true)} onLegendClick={() => setLegendOpen(true)} gibsDate={gibsDate} setGibsDate={setGibsDate} gibsOpacity={gibsOpacity} setGibsOpacity={setGibsOpacity} onEntityClick={setSelectedEntity} onFlyTo={(lat, lng) => setFlyToLocation({ lat, lng, ts: Date.now() })} trackedSdr={trackedSdr} setTrackedSdr={setTrackedSdr} />
-            </ErrorBoundary>
-          </motion.div>
-
-          {/* LEFT SIDEBAR TOGGLE TAB */}
-          <motion.div
-            className="absolute left-0 top-1/2 -translate-y-1/2 z-[201] pointer-events-auto hud-zone"
-            animate={{ x: leftOpen ? 344 : 0 }}
-            transition={{ type: 'spring', damping: 30, stiffness: 250 }}
-          >
-            <button
-              onClick={() => setLeftOpen(!leftOpen)}
-              className="flex flex-col items-center gap-1.5 py-5 px-1.5 bg-cyan-400 border border-cyan-400 border-l-0 rounded-r-md text-black hover:bg-cyan-300 hover:border-cyan-300 transition-colors shadow-[2px_0_12px_rgba(0,0,0,0.4)]"
+            {/* LEFT HUD CONTAINER — mirrors right side: one scroll container, scrollbar on LEFT edge */}
+            <motion.div
+              className="absolute left-6 top-24 bottom-9 w-80 flex flex-col gap-3 z-[201] pointer-events-auto overflow-y-auto styled-scrollbar pl-2 pr-2 hud-zone"
+              style={{ direction: 'rtl' }}
+              animate={{ x: leftOpen ? 0 : -360 }}
+              transition={{ type: 'spring', damping: 30, stiffness: 250 }}
             >
-              {leftOpen ? <ChevronLeft size={10} /> : <ChevronRight size={10} />}
-              <span className="text-[7px] font-mono tracking-[0.2em] font-bold text-black" style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>LAYERS</span>
-            </button>
-          </motion.div>
+              {/* 1. DATA LAYERS (Top) */}
+              <div className="contents" style={{ direction: 'ltr' }}>
+                {secondaryBootReady ? (
+                  <ErrorBoundary name="WorldviewLeftPanel">
+                    <WorldviewLeftPanel
+                      activeLayers={firstPaintActiveLayers}
+                      setActiveLayers={setActiveLayers}
+                      onResetLayers={resetActiveLayers}
+                      shodanResultCount={shodanResults.length}
+                      onSettingsClick={() => setSettingsOpen(true)}
+                      onLegendClick={() => setLegendOpen(true)}
+                      onOpenSarAoiEditor={() => setSarAoiEditorOpen(true)}
+                      gibsDate={gibsDate}
+                      setGibsDate={setGibsDate}
+                      gibsOpacity={gibsOpacity}
+                      setGibsOpacity={setGibsOpacity}
+                      sentinelDate={sentinelDate}
+                      setSentinelDate={setSentinelDate}
+                      sentinelOpacity={sentinelOpacity}
+                      setSentinelOpacity={setSentinelOpacity}
+                      sentinelPreset={sentinelPreset}
+                      setSentinelPreset={setSentinelPreset}
+                      onEntityClick={setSelectedEntity}
+                      onFlyTo={handleFlyTo}
+                      trackedSdr={trackedSdr}
+                      setTrackedSdr={setTrackedSdr}
+                      trackedScanner={trackedScanner}
+                      setTrackedScanner={setTrackedScanner}
+                      isMinimized={leftDataMinimized}
+                      onMinimizedChange={setLeftDataMinimized}
+                      viewBoundsRef={viewBoundsRef}
+                    />
+                  </ErrorBoundary>
+                ) : (
+                  <div className="bg-[#05090d]/95 border border-cyan-900/50 p-4 font-mono text-cyan-500/70">
+                    <div className="text-[11px] tracking-[0.2em] text-cyan-400 font-bold">{t('nav.dataLayers')}</div>
+                    <div className="mt-3 text-[10px] tracking-wider">{t('nav.prioritizingMapFeeds')}</div>
+                  </div>
+                )}
+              </div>
 
-          {/* RIGHT SIDEBAR TOGGLE TAB */}
-          <motion.div
-            className="absolute right-0 top-1/2 -translate-y-1/2 z-[201] pointer-events-auto hud-zone"
-            animate={{ x: rightOpen ? -344 : 0 }}
-            transition={{ type: 'spring', damping: 30, stiffness: 250 }}
-          >
-            <button
-              onClick={() => setRightOpen(!rightOpen)}
-              className="flex flex-col items-center gap-1.5 py-5 px-1.5 bg-cyan-400 border border-cyan-400 border-r-0 rounded-l-md text-black hover:bg-cyan-300 hover:border-cyan-300 transition-colors shadow-[-2px_0_12px_rgba(0,0,0,0.4)]"
+              {/* 2. MESHTASTIC CHAT (Middle) */}
+              {secondaryBootReady && (
+                <div className="contents" style={{ direction: 'ltr' }}>
+                  <MeshChat
+                    onFlyTo={handleFlyTo}
+                    expanded={leftMeshExpanded}
+                    onExpandedChange={setLeftMeshExpanded}
+                    onSettingsClick={() => setSettingsOpen(true)}
+                    onTerminalToggle={openSecureTerminalLauncher}
+                    onOpenLiveGate={openLiveGateFromShell}
+                    onOpenDeadDrop={openDeadDropFromShell}
+                    launchRequest={meshChatLaunchRequest}
+                  />
+                </div>
+              )}
+
+              {/* 3. SHODAN CONNECTOR (Bottom) */}
+              {secondaryBootReady && (
+                <div className="contents" style={{ direction: 'ltr' }}>
+                  <ShodanPanel
+                    currentResults={shodanResults}
+                    onOpenSettings={() => setSettingsOpen(true)}
+                    settingsOpen={settingsOpen}
+                    onResultsChange={(results, queryLabel) => {
+                      setShodanResults(results);
+                      setShodanQueryLabel(queryLabel);
+                      setActiveLayers((prev) => ({ ...prev, shodan_overlay: results.length > 0 }));
+                    }}
+                    onSelectEntity={setSelectedEntity}
+                    onStyleChange={setShodanStyle}
+                    isMinimized={leftShodanMinimized}
+                    onMinimizedChange={setLeftShodanMinimized}
+                  />
+                </div>
+              )}
+
+              {/* 4. RECON + SCM */}
+              {secondaryBootReady && (
+                <div className="contents" style={{ direction: 'ltr' }}>
+                  <ReconPanel />
+                  <ScmPanel layerEnabled={activeLayers.scm_suppliers} />
+                  <CyberThreatPanel layerEnabled={activeLayers.cyber_threats} />
+                </div>
+              )}
+
+              {/* 5. AI INTEL */}
+              {secondaryBootReady && (
+                <div className="contents" style={{ direction: 'ltr' }}>
+                  <AIIntelPanel
+                    onFlyTo={handleFlyTo}
+                    pinPlacementMode={pinPlacementMode}
+                    onPinPlacementModeChange={setPinPlacementMode}
+                  />
+                </div>
+              )}
+            </motion.div>
+
+            {/* LEFT SIDEBAR TOGGLE TAB — aligns with Data Layers section */}
+            <motion.div
+              className="absolute left-0 top-[12.5rem] z-[201] pointer-events-auto hud-zone"
+              animate={{ x: leftOpen ? 344 : 0 }}
+              transition={{ type: 'spring', damping: 30, stiffness: 250 }}
             >
-              {rightOpen ? <ChevronRight size={10} /> : <ChevronLeft size={10} />}
-              <span className="text-[7px] font-mono tracking-[0.2em] font-bold text-black" style={{ writingMode: 'vertical-rl' }}>INTEL</span>
-            </button>
-          </motion.div>
+              <button
+                onClick={() => setLeftOpen(!leftOpen)}
+                className="flex flex-col items-center gap-1.5 py-5 px-1.5 bg-cyan-950/40 border border-cyan-800/50 border-l-0 rounded-r text-cyan-700 hover:text-cyan-400 hover:bg-cyan-950/60 hover:border-cyan-500/40 transition-colors"
+              >
+                {leftOpen ? <ChevronLeft size={10} /> : <ChevronRight size={10} />}
+                <span
+                  className="text-[7px] font-mono tracking-[0.2em] font-bold"
+                  style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
+                >
+                  {t('nav.layers')}
+                </span>
+              </button>
+            </motion.div>
 
-          {/* RIGHT HUD CONTAINER — slides off right edge when hidden */}
-          <motion.div
-            className="absolute right-6 top-24 bottom-6 w-80 flex flex-col gap-4 z-[200] pointer-events-auto overflow-y-auto styled-scrollbar pr-2 hud-zone"
-            animate={{ x: rightOpen ? 0 : 360 }}
-            transition={{ type: 'spring', damping: 30, stiffness: 250 }}
-          >
-            <TopRightControls />
+            {/* RIGHT SIDEBAR TOGGLE TAB */}
+            <motion.div
+              className="absolute right-0 top-[12.5rem] z-[201] pointer-events-auto hud-zone"
+              animate={{ x: rightOpen ? -424 : 0 }}
+              transition={{ type: 'spring', damping: 30, stiffness: 250 }}
+            >
+              <button
+                onClick={() => setRightOpen(!rightOpen)}
+                className="flex flex-col items-center gap-1.5 py-5 px-1.5 bg-cyan-950/40 border border-cyan-800/50 border-r-0 rounded-l text-cyan-700 hover:text-cyan-400 hover:bg-cyan-950/60 hover:border-cyan-500/40 transition-colors"
+              >
+                {rightOpen ? <ChevronRight size={10} /> : <ChevronLeft size={10} />}
+                <span
+                  className="text-[7px] font-mono tracking-[0.2em] font-bold"
+                  style={{ writingMode: 'vertical-rl' }}
+                >
+                  {t('nav.intel')}
+                </span>
+              </button>
+            </motion.div>
 
-            {/* FIND / LOCATE */}
-            <div className="flex-shrink-0">
+            {/* RIGHT HUD CONTAINER — slides off right edge when hidden */}
+            <motion.div
+              className="absolute right-6 top-24 bottom-9 w-[400px] flex flex-col gap-4 z-[200] pointer-events-auto overflow-y-auto styled-scrollbar pr-2 pl-2 hud-zone"
+              animate={{ x: rightOpen ? 0 : 440 }}
+              transition={{ type: 'spring', damping: 30, stiffness: 250 }}
+            >
+              <TopRightControls
+                onTerminalToggle={openInfonet}
+                onInfonetToggle={toggleInfonet}
+                onSettingsClick={() => setSettingsOpen(true)}
+                onMeshChatNavigate={launchMeshChatTab}
+                dmCount={dmCount}
+              />
+
+              {/* FIND / LOCATE */}
+              <div className="flex-shrink-0">
               <FindLocateBar
-                data={data}
-                onLocate={(lat, lng, entityId, entityType) => {
+                onLocate={(lat, lng, _entityId, _entityType) => {
                   setFlyToLocation({ lat, lng, ts: Date.now() });
                 }}
                 onFilter={(filterKey, value) => {
-                  setActiveFilters(prev => {
-                    const current = prev[filterKey] || [];
-                    if (!current.includes(value)) {
-                      return { ...prev, [filterKey]: [...current, value] };
-                    }
-                    return prev;
-                  });
-                }}
-              />
-            </div>
-
-            {/* TOP RIGHT - MARKETS */}
-            <div className="flex-shrink-0">
-              <ErrorBoundary name="MarketsPanel">
-                <MarketsPanel data={data} />
-              </ErrorBoundary>
-            </div>
-
-            {/* SIGINT & RADIO INTERCEPTS */}
-            <div className="flex-shrink-0">
-              <ErrorBoundary name="RadioInterceptPanel">
-                <RadioInterceptPanel
-                  data={data}
-                  isEavesdropping={isEavesdropping}
-                  setIsEavesdropping={setIsEavesdropping}
-                  eavesdropLocation={eavesdropLocation}
-                  cameraCenter={cameraCenter}
-                  selectedEntity={selectedEntity}
+                    setActiveFilters((prev) => {
+                      const current = prev[filterKey] || [];
+                      if (!current.includes(value)) {
+                        return { ...prev, [filterKey]: [...current, value] };
+                      }
+                      return prev;
+                    });
+                  }}
                 />
-              </ErrorBoundary>
-            </div>
+              </div>
 
-            {/* DATA FILTERS */}
-            <div className="flex-shrink-0">
-              <ErrorBoundary name="FilterPanel">
-                <FilterPanel data={data} activeFilters={activeFilters} setActiveFilters={setActiveFilters} />
-              </ErrorBoundary>
-            </div>
+              {/* GLOBAL TICKER REPLACES MARKETS PANEL - RENDERED OUTSIDE THIS DIV */}
 
-            {/* BOTTOM RIGHT - NEWS FEED (fills remaining space) */}
-            <div className="flex-1 min-h-0 flex flex-col">
-              <ErrorBoundary name="NewsFeed">
-                <NewsFeed data={data} selectedEntity={selectedEntity} regionDossier={regionDossier} regionDossierLoading={regionDossierLoading} />
-              </ErrorBoundary>
-            </div>
-          </motion.div>
+              {/* EVENT TIMELINE */}
+              {secondaryBootReady && (
+                <div className={`flex-shrink-0 ${rightFocusedPanel && rightFocusedPanel !== 'predictions' ? 'hidden' : ''}`}>
+                  <ErrorBoundary name="TimelinePanel">
+                    <TimelinePanel />
+                  </ErrorBoundary>
+                </div>
+              )}
 
-          {/* BOTTOM CENTER COORDINATE / LOCATION BAR — hidden when Sentinel-2 imagery overlay is open */}
-          {!(selectedEntity?.type === 'region_dossier' && regionDossier?.sentinel2) && <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 1, duration: 1 }}
-            className="absolute bottom-6 left-1/2 -translate-x-1/2 z-[200] pointer-events-auto flex flex-col items-center gap-2 hud-zone"
+              {/* DATA FILTERS */}
+              <div className={`flex-shrink-0 ${rightFocusedPanel && rightFocusedPanel !== 'filters' ? 'hidden' : ''}`}>
+                <ErrorBoundary name="FilterPanel">
+                  <FilterPanel
+                    activeFilters={activeFilters}
+                    setActiveFilters={setActiveFilters}
+                    activeLayers={activeLayers}
+                    onEnableLayers={enableLayers}
+                  />
+                </ErrorBoundary>
+              </div>
+
+              {/* BOTTOM RIGHT - NEWS FEED (fills remaining space) */}
+              <div className={`flex-1 min-h-0 flex flex-col ${rightFocusedPanel ? 'hidden' : ''}`}>
+                <ErrorBoundary name="NewsFeed">
+                  <NewsFeed
+                    selectedEntity={selectedEntity}
+                    regionDossier={regionDossier}
+                    regionDossierLoading={regionDossierLoading}
+                    gtDossier={gtDossier}
+                    gtDossierLoading={gtDossierLoading}
+                    onExpandEntityGraph={handleExpandEntityGraph}
+                    onArticleClick={handleArticleClick}
+                  />
+                </ErrorBoundary>
+              </div>
+            </motion.div>
+
+            {/* BOTTOM CENTER COORDINATE / LOCATION BAR — hidden when fullscreen overlays are open */}
+            {!(selectedEntity?.type === 'region_dossier' && regionDossier?.sentinel2) && selectedEntity?.type !== 'cctv' && selectedEntity?.type !== 'news' && (
+              <motion.div
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 1, duration: 1 }}
+                className="absolute bottom-9 left-1/2 -translate-x-1/2 z-[200] pointer-events-auto flex flex-col items-center gap-2 hud-zone"
+              >
+                {/* LOCATE BAR — search by coordinates or place name */}
+                <LocateBar
+                  onLocate={(lat, lng, bounds) => setFlyToLocation({ lat, lng, bounds, ts: Date.now() })}
+                  onOpenChange={setLocateBarOpen}
+                />
+
+                <div
+                  className="bg-[#0a0a0a]/90 border border-cyan-900/40 px-6 py-2 flex items-center gap-6 border-b-2 border-b-cyan-800 cursor-pointer backdrop-blur-sm"
+                  onClick={cycleStyle}
+                >
+                  {/* Coordinates */}
+                  <div className="flex flex-col items-center min-w-[140px]">
+                    <div className="text-[10px] text-[var(--text-muted)] font-mono tracking-[0.2em]">
+                      {t('controls.coordinates')}
+                    </div>
+                    <div className="text-[14px] text-cyan-400 font-mono font-bold tracking-wide">
+                      {mouseCoords
+                        ? `${mouseCoords.lat.toFixed(4)}, ${mouseCoords.lng.toFixed(4)}`
+                        : '0.0000, 0.0000'}
+                    </div>
+                  </div>
+
+                  {/* Divider */}
+                  <div className="w-px h-6 bg-[var(--border-primary)]" />
+
+                  {/* Location name */}
+                  <div className="flex flex-col items-center min-w-[180px] max-w-[320px]">
+                    <div className="text-[10px] text-[var(--text-muted)] font-mono tracking-[0.2em]">
+                      {t('controls.location')}
+                    </div>
+                    <div className="text-[13px] text-[var(--text-secondary)] font-mono truncate max-w-[320px]">
+                      {locationLabel || t('controls.hoverMap')}
+                    </div>
+                  </div>
+
+                  {/* Divider */}
+                  <div className="w-px h-6 bg-[var(--border-primary)]" />
+
+                  {/* Style preset (compact) */}
+                  <div className="flex flex-col items-center">
+                    <div className="text-[10px] text-[var(--text-muted)] font-mono tracking-[0.2em]">
+                      {t('controls.style')}
+                    </div>
+                    <div className="text-[14px] text-cyan-400 font-mono font-bold">
+                      {activeStyle}
+                    </div>
+                  </div>
+
+                  {/* Divider */}
+                  <div className="w-px h-6 bg-[var(--border-primary)]" />
+
+                  {/* Space Weather */}
+                  {(() => {
+                    const sw = spaceWeather as { kp_index?: number; kp_text?: string } | undefined;
+                    return (
+                      <div
+                        className="flex flex-col items-center"
+                        title={`Kp Index: ${sw?.kp_index ?? 'N/A'}`}
+                      >
+                        <div className="text-[10px] text-[var(--text-muted)] font-mono tracking-[0.2em]">
+                          {t('controls.solar')}
+                        </div>
+                        <div
+                          className={`text-[14px] font-mono font-bold ${
+                            (sw?.kp_index ?? 0) >= 5
+                              ? 'text-red-400'
+                              : (sw?.kp_index ?? 0) >= 4
+                                ? 'text-yellow-400'
+                                : 'text-green-400'
+                          }`}
+                        >
+                          {sw?.kp_text || t('controls.na')}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Divider */}
+                  <div className="w-px h-6 bg-[var(--border-primary)]" />
+
+                  {/* Feed Health */}
+                  <div className="flex items-center gap-3">
+                    {feedHealth.map((f) => (
+                      <div key={f.label} className="flex items-center gap-1 text-[10px] font-mono tracking-wider">
+                        <span className={`feed-dot feed-dot-${f.status}`} />
+                        <span className="text-[var(--text-muted)]">{f.label}</span>
+                        <span className="text-cyan-400 font-bold">{f.count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </>
+        )}
+
+        {/* RESTORE UI BUTTON (If Hidden) */}
+        {!uiVisible && (
+          <button
+            onClick={() => setUiVisible(true)}
+            className="absolute bottom-9 right-6 z-[200] bg-[var(--bg-primary)]/80 border border-[var(--border-primary)] px-4 py-2 text-[10px] font-mono tracking-widest text-cyan-500 hover:text-cyan-300 hover:border-cyan-800 transition-colors pointer-events-auto"
           >
-            {/* LOCATE BAR — search by coordinates or place name */}
-            <LocateBar onLocate={(lat, lng) => setFlyToLocation({ lat, lng, ts: Date.now() })} />
+            {t('nav.restoreUi')}
+          </button>
+        )}
 
-            <div
-              className="bg-[var(--bg-primary)]/60 backdrop-blur-md border border-[var(--border-primary)] rounded-xl px-6 py-2.5 flex items-center gap-6 shadow-[0_4px_30px_rgba(0,0,0,0.2)] border-b-2 border-b-cyan-900"
-            >
-              {/* Coordinates */}
-              <div className="flex flex-col items-center min-w-[120px]">
-                <div className="text-[8px] text-[var(--text-muted)] font-mono tracking-[0.2em]">COORDINATES</div>
-                <div className="text-[11px] text-cyan-400 font-mono font-bold tracking-wide">
-                  {mouseCoords ? `${mouseCoords.lat.toFixed(4)}, ${mouseCoords.lng.toFixed(4)}` : '0.0000, 0.0000'}
-                </div>
-              </div>
-
-              {/* Divider */}
-              <div className="w-px h-8 bg-[var(--border-primary)]" />
-
-              {/* Location name */}
-              <div className="flex flex-col items-center min-w-[180px] max-w-[320px]">
-                <div className="text-[8px] text-[var(--text-muted)] font-mono tracking-[0.2em]">LOCATION</div>
-                <div className="text-[10px] text-[var(--text-secondary)] font-mono truncate max-w-[320px]">
-                  {locationLabel || 'Hover over map...'}
-                </div>
-              </div>
-
-              {/* Divider */}
-              <div className="w-px h-8 bg-[var(--border-primary)]" />
-
-              {/* Style preset (compact) */}
-              <div className="flex flex-col items-center cursor-pointer" onClick={cycleStyle}>
-                <div className="text-[8px] text-[var(--text-muted)] font-mono tracking-[0.2em]">STYLE</div>
-                <div className="text-[11px] text-cyan-400 font-mono font-bold">{activeStyle}</div>
-              </div>
-
-              {/* Divider */}
-              <div className="w-px h-8 bg-[var(--border-primary)]" />
-
-              {/* Space Weather */}
-              <div className="flex flex-col items-center" title={`Kp Index: ${data?.space_weather?.kp_index ?? 'N/A'}`}>
-                <div className="text-[8px] text-[var(--text-muted)] font-mono tracking-[0.2em]">SOLAR</div>
-                <div className={`text-[11px] font-mono font-bold ${
-                  (data?.space_weather?.kp_index ?? 0) >= 5 ? 'text-red-400' :
-                  (data?.space_weather?.kp_index ?? 0) >= 4 ? 'text-yellow-400' :
-                  'text-green-400'
-                }`}>
-                  {data?.space_weather?.kp_text || 'N/A'}
-                </div>
-              </div>
-            </div>
-          </motion.div>}
-        </>
-      )}
-
-      {/* RESTORE UI BUTTON (If Hidden) */}
-      {!uiVisible && (
-        <button
-          onClick={() => setUiVisible(true)}
-          className="absolute bottom-6 right-6 z-[200] bg-[var(--bg-primary)]/60 backdrop-blur-md border border-[var(--border-primary)] rounded px-4 py-2 text-[10px] font-mono tracking-widest text-cyan-500 hover:text-cyan-300 hover:border-cyan-800 transition-colors pointer-events-auto"
-        >
-          RESTORE UI
-        </button>
-      )}
-
-      {/* DYNAMIC SCALE BAR */}
-      <div className="absolute bottom-[5.5rem] left-[26rem] z-[201] pointer-events-auto">
-        <ScaleBar
-          zoom={mapView.zoom}
-          latitude={mapView.latitude}
-          measureMode={measureMode}
-          measurePoints={measurePoints}
-          onToggleMeasure={() => {
-            setMeasureMode(m => !m);
-            if (measureMode) setMeasurePoints([]);
-          }}
-          onClearMeasure={() => setMeasurePoints([])}
-        />
-      </div>
-
-      {/* STATIC CRT VIGNETTE */}
-      <div className="absolute inset-0 pointer-events-none z-[2]"
-        style={{
-          background: 'radial-gradient(circle, transparent 40%, rgba(0,0,0,0.8) 100%)'
-        }}
-      />
-
-      {/* SCANLINES OVERLAY */}
-      <div className="absolute inset-0 pointer-events-none z-[3] opacity-5 bg-[linear-gradient(rgba(255,255,255,0.1)_1px,transparent_1px)]" style={{ backgroundSize: '100% 4px' }}></div>
-
-      {/* SETTINGS PANEL */}
-      <ErrorBoundary name="SettingsPanel">
-        <SettingsPanel isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
-      </ErrorBoundary>
-
-      {/* MAP LEGEND */}
-      <ErrorBoundary name="MapLegend">
-        <MapLegend isOpen={legendOpen} onClose={() => setLegendOpen(false)} />
-      </ErrorBoundary>
-
-      {/* ONBOARDING MODAL */}
-      {showOnboarding && (
-        <OnboardingModal
-          onClose={() => setShowOnboarding(false)}
-          onOpenSettings={() => { setShowOnboarding(false); setSettingsOpen(true); }}
-        />
-      )}
-
-      {/* v0.4 CHANGELOG MODAL — shows once per version after onboarding */}
-      {!showOnboarding && showChangelog && (
-        <ChangelogModal onClose={() => setShowChangelog(false)} />
-      )}
-
-      {/* BACKEND DISCONNECTED BANNER */}
-      {backendStatus === 'disconnected' && (
-        <div className="absolute top-0 left-0 right-0 z-[9000] flex items-center justify-center py-2 bg-red-950/90 border-b border-red-500/40 backdrop-blur-sm">
-          <span className="text-[10px] font-mono tracking-widest text-red-400">
-            BACKEND OFFLINE — Cannot reach backend server. Check that the backend container is running and BACKEND_URL is correct.
-          </span>
+        {/* DYNAMIC SCALE BAR — hidden when fullscreen overlays or locate bar are open */}
+        {!(selectedEntity?.type === 'region_dossier' && regionDossier?.sentinel2) && selectedEntity?.type !== 'cctv' && selectedEntity?.type !== 'news' && !locateBarOpen && (
+        <div className="absolute bottom-[7rem] left-[23rem] z-[201] pointer-events-auto">
+          <ScaleBar
+            zoom={mapView.zoom}
+            latitude={mapView.latitude}
+            measureMode={measureMode}
+            measurePoints={measurePoints}
+            onToggleMeasure={() => {
+              setMeasureMode((m) => !m);
+              if (measureMode) setMeasurePoints([]);
+            }}
+            onClearMeasure={() => setMeasurePoints([])}
+          />
         </div>
-      )}
+        )}
 
-    </main>
-    </DashboardDataProvider>
+        {/* STATIC CRT VIGNETTE */}
+        <div
+          className="absolute inset-0 pointer-events-none z-[2]"
+          style={{
+            background: 'radial-gradient(circle, transparent 40%, rgba(0,0,0,0.8) 100%)',
+          }}
+        />
+
+        {/* SCANLINES OVERLAY */}
+        <div
+          className="absolute inset-0 pointer-events-none z-[3] opacity-[0.08] bg-[linear-gradient(rgba(255,255,255,0.1)_1px,transparent_1px)]"
+          style={{ backgroundSize: '100% 4px' }}
+        ></div>
+
+        {/* WATCHLIST WIDGET */}
+        <WatchlistWidget
+          items={watchlistItems}
+          onRemove={removeFromWatchlist}
+          onClear={clearWatchlist}
+          onFlyTo={handleFlyTo}
+        />
+
+
+        {/* SETTINGS PANEL */}
+        <ErrorBoundary name="SettingsPanel">
+          <SettingsPanel isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+        </ErrorBoundary>
+
+        {/* MAP LEGEND */}
+        <ErrorBoundary name="MapLegend">
+          <MapLegend isOpen={legendOpen} onClose={() => setLegendOpen(false)} />
+        </ErrorBoundary>
+
+        {/* KEYBOARD SHORTCUTS OVERLAY */}
+        <KeyboardShortcutsOverlay isOpen={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+
+        {/* ALERT TOAST NOTIFICATIONS */}
+        <AlertToast
+          toasts={toasts}
+          onDismiss={dismissToast}
+          onFlyTo={handleFlyTo}
+        />
+
+        {/* AIS UPSTREAM OUTAGE BANNER — renders only when AIS is configured
+            but the WebSocket upstream is unreachable. Tells users the empty
+            ocean isn't their fault. */}
+        <AisUpstreamBanner onOpenApiKeys={() => setSettingsOpen(true)} />
+
+        {/* ONBOARDING MODAL */}
+        {showOnboarding && (
+          <OnboardingModal
+            onClose={() => {
+              setShowOnboarding(false);
+              markChangelogSeen();
+              setShowChangelog(false);
+            }}
+            onOpenSettings={() => {
+              setShowOnboarding(false);
+              markChangelogSeen();
+              setShowChangelog(false);
+              setSettingsOpen(true);
+            }}
+          />
+        )}
+
+        {/* FIRST-RUN WARMUP NOTICE — shows once after onboarding */}
+        {!showOnboarding && showWarmupNotice && (
+          <StartupWarmupModal onClose={() => setShowWarmupNotice(false)} />
+        )}
+
+        {/* v0.4 CHANGELOG MODAL — shows once per version after onboarding */}
+        {!showOnboarding && !showWarmupNotice && showChangelog && (
+          <ChangelogModal onClose={() => setShowChangelog(false)} />
+        )}
+
+        {/* SENTINEL HUB — first-time info modal (extracted to SentinelInfoModal.tsx) */}
+        {showSentinelInfo && (
+          <SentinelInfoModal onClose={() => setShowSentinelInfo(false)} />
+        )}
+
+        {/* SAR AOI EDITOR — portals to document.body internally */}
+        {(sarAoiEditorOpen || sarAoiDropMode) && (
+          <SarAoiEditorModal
+            onClose={() => { setSarAoiEditorOpen(false); setSarAoiDropMode(false); }}
+            onRequestMapPick={() => { setSarAoiEditorOpen(false); setSarAoiDropMode(true); }}
+            pickedCoords={sarAoiDroppedCoords}
+            onPickConsumed={() => setSarAoiDroppedCoords(null)}
+            onAoiListChanged={() => setSarAoiListVersion((v) => v + 1)}
+            dropModeActive={sarAoiDropMode}
+          />
+        )}
+
+        {/* MESH TERMINAL */}
+        <MeshTerminal
+          isOpen={terminalOpen}
+          launchToken={terminalLaunchToken}
+          onClose={() => setTerminalOpen(false)}
+          onDmCount={setDmCount}
+          onSettingsClick={() => setSettingsOpen(true)}
+        />
+
+        {showEntityGraph && selectedEntity && isEntityGraphEligible(selectedEntity) && (
+          <EntityGraphPanel entity={selectedEntity} onClose={() => setShowEntityGraph(false)} />
+        )}
+
+        {/* INFONET TERMINAL */}
+        <InfonetTerminal
+          isOpen={infonetOpen}
+          onClose={closeInfonet}
+          onOpenLiveGate={openLiveGateFromShell}
+          onOpenDeadDrop={openDeadDropFromShell}
+        />
+
+        <InfonetLeaveConfirm />
+
+        {/* BACKEND DISCONNECTED BANNER */}
+        {backendStatus === 'disconnected' && (
+          <div className="absolute top-0 left-0 right-0 z-[9000] flex items-center justify-center py-2 bg-red-950/90 border-b border-red-500/40 backdrop-blur-sm">
+            <span className="text-[10px] font-mono tracking-widest text-red-400">
+              {t('backend.offline')}
+            </span>
+          </div>
+        )}
+        {/* BOTTOM TICKER TOGGLE TAB — moved to center-right to avoid panel overlap */}
+        <motion.div
+           className={`absolute bottom-0 right-[28rem] z-[8001] pointer-events-auto hud-zone transition-opacity duration-300 ${tickerOpen ? 'opacity-100' : 'opacity-40 hover:opacity-100'}`}
+           animate={{ y: tickerOpen ? -28 : 0 }}
+           transition={{ type: 'spring', damping: 30, stiffness: 250 }}
+        >
+          <button
+            onClick={() => setTickerOpen(!tickerOpen)}
+            className="flex items-center gap-2 px-3 py-1 bg-cyan-950/40 border border-cyan-800/50 border-b-0 rounded-t text-cyan-700 hover:text-cyan-400 hover:bg-cyan-950/60 hover:border-cyan-500/40 transition-colors"
+          >
+            <div className="text-[7.5px] font-mono tracking-[0.25em] font-bold uppercase">
+              {t('nav.markets')}
+            </div>
+            {tickerOpen ? <ChevronDown size={10} /> : <ChevronUp size={10} />}
+          </button>
+        </motion.div>
+
+        {/* GLOBAL MARKETS TICKER (BOTTOM ANCHOR) */}
+        <motion.div
+          className="absolute bottom-0 left-0 right-0 z-[8000] h-7"
+          animate={{ y: tickerOpen ? 0 : 28 }}
+          transition={{ type: 'spring', damping: 30, stiffness: 250 }}
+        >
+          <ErrorBoundary name="GlobalTicker">
+            <GlobalTicker />
+          </ErrorBoundary>
+        </motion.div>
+
+      </main>
+    </>
   );
 }

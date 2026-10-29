@@ -1,14 +1,40 @@
 """News fetching, geocoding, clustering, and risk assessment."""
+import os
 import re
+import time
 import logging
+import calendar
 import concurrent.futures
+
 import requests
 import feedparser
 from services.network_utils import fetch_with_curl
 from services.fetchers._store import latest_data, _data_lock, _mark_fresh
 from services.fetchers.retry import with_retry
+from services.fetchers.xquik_news import fetch_xquik_entries
+from services.oracle_service import enrich_news_items, compute_global_threat_level, detect_breaking_events
+
+
+def news_fetch_enabled() -> bool:
+    """Return True only when the operator explicitly opts into news RSS pulls.
+
+    Defaults to **on** for backward compatibility (this is the only fetcher
+    where opting out is the new behavior, not the old one). Set
+    ``NEWS_ENABLED=false`` to disable all outbound RSS feed traffic.
+    """
+    return str(os.environ.get("NEWS_ENABLED", "true")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
 
 logger = logging.getLogger("services.data_fetcher")
+
+# Maximum article age in seconds.  Anything older than this is dropped
+# during each fetch cycle so the threat feed stays current.
+_MAX_ARTICLE_AGE_SECS = 48 * 3600  # 48 hours
 
 
 # Keyword -> coordinate mapping for geocoding news articles
@@ -134,25 +160,36 @@ _KEYWORD_COORDS = {
 _SORTED_KEYWORDS = sorted(_KEYWORD_COORDS.items(), key=lambda x: len(x[0]), reverse=True)
 
 
+def resolve_coords_match(text: str) -> tuple[tuple[float, float], str] | None:
+    """Return ((lat, lng), matched_keyword) for the most specific keyword hit."""
+    padded_text = f" {text} "
+    for kw, coords in _SORTED_KEYWORDS:
+        if kw.startswith(" ") or kw.endswith(" "):
+            if kw in padded_text:
+                return coords, kw
+        elif re.search(r"\b" + re.escape(kw) + r"\b", text):
+            return coords, kw
+    return None
+
+
 def _resolve_coords(text: str) -> tuple[float, float] | None:
     """Return (lat, lng) for the most specific keyword match, or None.
 
     Longer keywords are tried first. Space-padded keywords (" us ", " uk ")
     use substring matching on padded text; all others use word-boundary regex.
     """
-    padded_text = f" {text} "
-    for kw, coords in _SORTED_KEYWORDS:
-        if kw.startswith(" ") or kw.endswith(" "):
-            if kw in padded_text:
-                return coords
-        else:
-            if re.search(r'\b' + re.escape(kw) + r'\b', text):
-                return coords
-    return None
+    match = resolve_coords_match(text)
+    return match[0] if match else None
 
 
 @with_retry(max_retries=1, base_delay=2)
 def fetch_news():
+    if not news_fetch_enabled():
+        logger.debug("News fetch skipped; unset NEWS_ENABLED=false to re-enable")
+        with _data_lock:
+            latest_data["news"] = []
+        _mark_fresh("news")
+        return
     from services.news_feed_config import get_feeds
     feed_config = get_feeds()
     feeds = {f["name"]: f["url"] for f in feed_config}
@@ -165,18 +202,34 @@ def fetch_news():
         source_name, url = item
         try:
             xml_data = fetch_with_curl(url, timeout=10).text
-            return source_name, feedparser.parse(xml_data)
+            return source_name, feedparser.parse(xml_data).entries
         except (requests.RequestException, ConnectionError, TimeoutError, ValueError, KeyError, OSError) as e:
             logger.warning(f"Feed {source_name} failed: {e}")
-            return source_name, None
+            return source_name, []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(feeds)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(feeds), 6)) as pool:
         feed_results = list(pool.map(_fetch_feed, feeds.items()))
 
-    for source_name, feed in feed_results:
-        if not feed:
+    for entry in fetch_xquik_entries():
+        source_name = entry["source"]
+        source_weights[source_name] = 3
+        feed_results.append((source_name, [entry]))
+
+    for source_name, entries in feed_results:
+        if not entries:
             continue
-        for entry in feed.entries[:5]:
+        for entry in entries[:5]:
+            # Drop articles older than the max-age threshold so the
+            # threat feed doesn't show stale stories across cycles.
+            pp = entry.get("published_parsed")
+            if pp:
+                try:
+                    entry_epoch = calendar.timegm(pp)
+                    if time.time() - entry_epoch > _MAX_ARTICLE_AGE_SECS:
+                        continue
+                except (TypeError, ValueError, OverflowError):
+                    pass  # unparseable date — keep the article
+
             title = entry.get('title', '')
             summary = entry.get('summary', '')
 
@@ -191,7 +244,14 @@ def fetch_news():
                 elif alert_level == "Orange": risk_score = 7
                 else: risk_score = 4
             else:
-                risk_keywords = ['war', 'missile', 'strike', 'attack', 'crisis', 'tension', 'military', 'conflict', 'defense', 'clash', 'nuclear']
+                risk_keywords = [
+                    'war', 'missile', 'strike', 'attack', 'crisis', 'tension',
+                    'military', 'conflict', 'defense', 'clash', 'nuclear',
+                    'sanctions', 'ceasefire', 'invasion', 'drone', 'artillery',
+                    'blockade', 'escalation', 'casualties', 'airspace',
+                    'mobilization', 'proxy', 'insurgent', 'coup',
+                    'assassination', 'bioweapon', 'chemical',
+                ]
                 text = (title + " " + summary).lower()
 
                 risk_score = 1
@@ -268,6 +328,36 @@ def fetch_news():
         })
 
     news_items.sort(key=lambda x: x['risk_score'], reverse=True)
+
+    # Oracle enrichment: sentiment, oracle scores, prediction market odds
+    try:
+        with _data_lock:
+            markets = list(latest_data.get("prediction_markets", []))
+        enrich_news_items(news_items, source_weights, markets)
+        detect_breaking_events(news_items)
+    except Exception as e:
+        logger.warning(f"Oracle enrichment failed (news still usable): {e}")
+
+    # Global threat level computation (fuses news + markets + military + jamming)
+    try:
+        with _data_lock:
+            markets = list(latest_data.get("prediction_markets", []))
+            mil_flights = list(latest_data.get("military_flights", []))
+            jam_zones = list(latest_data.get("gps_jamming", []))
+            ships = list(latest_data.get("ships", []))
+            corr_alerts = list(latest_data.get("correlations", []))
+        threat_level = compute_global_threat_level(
+            news_items, markets,
+            military_flights=mil_flights,
+            gps_jamming=jam_zones,
+            ships=ships,
+            correlations=corr_alerts,
+        )
+    except Exception as e:
+        logger.warning(f"Threat level computation failed: {e}")
+        threat_level = {"score": 0, "level": "GREEN", "color": "#22c55e", "drivers": []}
+
     with _data_lock:
         latest_data['news'] = news_items
+        latest_data['threat_level'] = threat_level
     _mark_fresh("news")

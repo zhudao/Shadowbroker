@@ -1,8 +1,16 @@
 """Tests for the shared in-memory data store."""
+
 import threading
 import time
 import pytest
-from services.fetchers._store import latest_data, source_timestamps, _mark_fresh, _data_lock
+from services.fetchers._store import (
+    latest_data,
+    source_timestamps,
+    _mark_fresh,
+    _data_lock,
+    get_data_version,
+    bump_data_version,
+)
 
 
 class TestLatestDataStructure:
@@ -10,19 +18,46 @@ class TestLatestDataStructure:
 
     def test_has_all_required_keys(self):
         expected_keys = {
-            "last_updated", "news", "stocks", "oil", "flights", "ships",
-            "military_flights", "tracked_flights", "cctv", "weather",
-            "earthquakes", "uavs", "frontlines", "gdelt", "liveuamap",
-            "kiwisdr", "space_weather", "internet_outages", "firms_fires",
-            "datacenters"
+            "last_updated",
+            "news",
+            "stocks",
+            "oil",
+            "flights",
+            "ships",
+            "military_flights",
+            "tracked_flights",
+            "cctv",
+            "weather",
+            "earthquakes",
+            "uavs",
+            "frontlines",
+            "gdelt",
+            "liveuamap",
+            "kiwisdr",
+            "space_weather",
+            "internet_outages",
+            "firms_fires",
+            "datacenters",
         }
         assert expected_keys.issubset(set(latest_data.keys()))
 
     def test_list_keys_default_to_empty_list(self):
-        list_keys = ["news", "flights", "ships", "military_flights",
-                     "tracked_flights", "cctv", "earthquakes", "uavs",
-                     "gdelt", "liveuamap", "kiwisdr", "internet_outages",
-                     "firms_fires", "datacenters"]
+        list_keys = [
+            "news",
+            "flights",
+            "ships",
+            "military_flights",
+            "tracked_flights",
+            "cctv",
+            "earthquakes",
+            "uavs",
+            "gdelt",
+            "liveuamap",
+            "kiwisdr",
+            "internet_outages",
+            "firms_fires",
+            "datacenters",
+        ]
         for key in list_keys:
             assert isinstance(latest_data[key], list), f"{key} should default to list"
 
@@ -60,6 +95,20 @@ class TestMarkFresh:
         _mark_fresh("update_test")
         ts2 = source_timestamps["update_test"]
         assert ts2 >= ts1
+
+    def test_mark_fresh_bumps_data_version(self):
+        version_before = get_data_version()
+        _mark_fresh("version_test")
+        assert get_data_version() == version_before + 1
+
+
+class TestDataVersion:
+    """Tests for the monotonic data version counter."""
+
+    def test_bump_data_version_increments_counter(self):
+        version_before = get_data_version()
+        bump_data_version()
+        assert get_data_version() == version_before + 1
 
 
 class TestDataLock:
