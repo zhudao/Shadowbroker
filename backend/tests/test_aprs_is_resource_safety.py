@@ -7,8 +7,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from services import aprs_is_bridge as aprs_module
 from services.aprs_is_bridge import (
     APRSISBridge,
+    APRSLoginRefused,
     aprs_connection_config,
 )
 
@@ -22,6 +24,7 @@ _APRS_ENV = (
     "APRS_IS_LAT",
     "APRS_IS_LON",
     "APRS_IS_RADIUS_KM",
+    "APRS_IS_EXTRA_RANGES",
     "APRS_IS_CALLSIGN",
     "APRS_IS_MAX_SIGNALS",
 )
@@ -56,6 +59,40 @@ def test_public_aprs_uses_bounded_geographic_filter(monkeypatch: pytest.MonkeyPa
     assert config.filter_expr == "r/40.71280/-74.00600/250"
     assert "filter r/40.71280/-74.00600/250" in config.login
     assert "25000" not in config.login
+
+
+def test_public_aprs_accepts_extra_bounded_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_public(monkeypatch)
+    monkeypatch.setenv("APRS_IS_RADIUS_KM", "500")
+    monkeypatch.setenv("APRS_IS_EXTRA_RANGES", "51.5,-0.12,500; 35.68,139.69,300;")
+
+    config = aprs_connection_config()
+
+    assert config is not None
+    assert config.filter_expr == (
+        "r/40.71280/-74.00600/500 r/51.50000/-0.12000/500 r/35.68000/139.69000/300"
+    )
+    assert config.login.endswith(f"filter {config.filter_expr}" + chr(13) + chr(10))
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ("51.5,-0.12,25000", "between 1 and 500 km"),
+        ("51.5,-0.12", "lat,lon,radius_km"),
+        ("north,-0.12,100", "numeric"),
+        ("95,-0.12,100", "outside valid coordinate bounds"),
+        (";".join(["10,10,100"] * 9), "at most 8 extra ranges"),
+    ],
+)
+def test_public_aprs_rejects_unsafe_extra_ranges(
+    monkeypatch: pytest.MonkeyPatch, extra: str, message: str
+) -> None:
+    _enable_public(monkeypatch)
+    monkeypatch.setenv("APRS_IS_EXTRA_RANGES", extra)
+
+    with pytest.raises(ValueError, match=message):
+        aprs_connection_config()
 
 
 def test_public_aprs_rejects_global_scale_radius(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,6 +159,78 @@ def test_reconnect_backoff_is_exponential_and_capped(monkeypatch: pytest.MonkeyP
     assert APRSISBridge._reconnect_delay(5) == 480.0
     assert APRSISBridge._reconnect_delay(6) == 900.0
     assert APRSISBridge._reconnect_delay(99) == 900.0
+
+
+class _FakeSocket:
+    """Hands back prepared chunks, then reports the connection as closed."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def settimeout(self, _value: float) -> None:
+        pass
+
+    def recv(self, _size: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _pool(monkeypatch: pytest.MonkeyPatch, addresses: list[str]) -> None:
+    infos = [(2, 1, 6, "", (address, 14580)) for address in addresses]
+    monkeypatch.setattr(aprs_module.socket, "getaddrinfo", lambda *args, **kwargs: infos)
+
+
+def test_refused_login_is_reported_and_that_server_is_set_aside(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_public(monkeypatch)
+    config = aprs_connection_config()
+    assert config is not None
+    bridge = APRSISBridge()
+    _pool(monkeypatch, ["192.0.2.1", "192.0.2.2"])
+    sock = _FakeSocket([b"# aprsc 3.0.1\r\n", b"# Login by user not allowed\r\n", b"N0CALL>APRS:>never parsed\r\n"])
+    monkeypatch.setattr(bridge, "_open_socket", lambda _config: (sock, "192.0.2.1"))
+
+    with pytest.raises(APRSLoginRefused):
+        bridge._connect_and_read(config)
+
+    assert sock.closed is True
+    assert bridge._login_accepted is False
+    assert len(bridge.signals) == 0
+    # The refusing server is skipped while another one is available...
+    for _ in range(20):
+        assert bridge._candidate_servers(config) == ["192.0.2.2"]
+    # ...and tried again only when every known server has refused.
+    bridge._refused["192.0.2.2"] = aprs_module.time.monotonic()
+    assert sorted(bridge._candidate_servers(config)) == ["192.0.2.1", "192.0.2.2"]
+
+
+def test_accepted_login_is_noticed_and_old_refusals_expire(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_public(monkeypatch)
+    config = aprs_connection_config()
+    assert config is not None
+    bridge = APRSISBridge()
+    _pool(monkeypatch, ["192.0.2.1", "192.0.2.2"])
+    sock = _FakeSocket([b"# aprsc 3.0.2\r\n", b"# logresp N0CALL unverified, server T2TEST\r\n"])
+    monkeypatch.setattr(bridge, "_open_socket", lambda _config: (sock, "192.0.2.2"))
+
+    bridge._connect_and_read(config)  # the server closing the link is not a refusal
+
+    assert bridge._login_accepted is True
+    assert bridge._refused == {}
+    bridge._refused["192.0.2.1"] = aprs_module.time.monotonic() - aprs_module._REFUSED_SERVER_TTL_S - 1
+    assert sorted(bridge._candidate_servers(config)) == ["192.0.2.1", "192.0.2.2"]
+
+
+def test_refusals_never_retry_faster_than_a_short_pause_and_are_capped() -> None:
+    assert aprs_module._REFUSAL_RETRY_S >= 5.0
+    assert aprs_module._MAX_REFUSALS_PER_ROUND <= 6
+    assert aprs_module._HEALTHY_SESSION_S >= 300.0
 
 
 def test_invalid_public_config_fails_closed_without_starting_thread(

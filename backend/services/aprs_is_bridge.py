@@ -14,6 +14,7 @@ import random
 import re
 import socket
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,12 +30,28 @@ _DEFAULT_HOST = "rotate.aprs2.net"
 _DEFAULT_PORT = 14580
 _DEFAULT_RADIUS_KM = 100.0
 _MAX_PUBLIC_RADIUS_KM = 500.0
+# APRS-IS servers accept at most 9 range filters on one connection.
+_MAX_PUBLIC_RANGES = 9
 _DEFAULT_MAX_SIGNALS = 5000
 _MAX_SIGNAL_CAP = 20000
 _SIGNAL_MAX_AGE_S = 600.0
 _RECONNECT_BASE_S = 30.0
 _RECONNECT_MAX_S = 900.0
 _CALLSIGN_RE = re.compile(r"^[A-Z0-9-]{1,9}$")
+# A pool name such as rotate.aprs2.net stands for many independent servers.
+# Some of them refuse receive-only logins. A refusal says nothing about the
+# others, so the next one is tried after a short pause instead of the long
+# reconnect backoff, and the refusing server is left alone for a while.
+_REFUSED_SERVER_TTL_S = 3600.0
+_REFUSAL_RETRY_S = 5.0
+_MAX_REFUSALS_PER_ROUND = 6
+# A session must have worked for this long before the reconnect backoff starts over.
+_HEALTHY_SESSION_S = 300.0
+_LOGIN_REFUSED_MARKERS = (b"login by user not allowed", b"login not allowed")
+
+
+class APRSLoginRefused(ConnectionError):
+    """The server answered the login with a refusal."""
 
 
 @dataclass(frozen=True)
@@ -103,11 +120,50 @@ def _parse_public_range() -> tuple[float, float, float]:
     return lat, lon, radius
 
 
+def _parse_extra_public_ranges() -> list[tuple[float, float, float]]:
+    """Parse APRS_IS_EXTRA_RANGES: more bounded circles on the same connection.
+
+    Format: ``lat,lon,radius_km;lat,lon,radius_km``. Every circle obeys the same
+    limits as the main one, and the total is capped at what an APRS-IS server
+    accepts, so the subscription stays regional and never becomes a full feed.
+    """
+    raw = (os.getenv("APRS_IS_EXTRA_RANGES") or "").strip()
+    if not raw:
+        return []
+    ranges: list[tuple[float, float, float]] = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        fields = [f.strip() for f in part.split(",")]
+        if len(fields) != 3:
+            raise ValueError("APRS_IS_EXTRA_RANGES entries must be lat,lon,radius_km")
+        try:
+            lat, lon, radius = (float(f) for f in fields)
+        except ValueError as exc:
+            raise ValueError("APRS_IS_EXTRA_RANGES entries must be numeric") from exc
+        if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+            raise ValueError("APRS_IS_EXTRA_RANGES has a center outside valid coordinate bounds")
+        if not 1.0 <= radius <= _MAX_PUBLIC_RADIUS_KM:
+            raise ValueError(
+                f"APRS_IS_EXTRA_RANGES radius must be between 1 and {_MAX_PUBLIC_RADIUS_KM:g} km "
+                "when using public APRS-IS"
+            )
+        ranges.append((lat, lon, radius))
+    if len(ranges) > _MAX_PUBLIC_RANGES - 1:
+        raise ValueError(
+            f"APRS_IS_EXTRA_RANGES allows at most {_MAX_PUBLIC_RANGES - 1} extra ranges "
+            f"({_MAX_PUBLIC_RANGES} in total)"
+        )
+    return ranges
+
+
 def aprs_connection_config() -> APRSISConfig | None:
     """Build the receive configuration, failing closed on unsafe public filters.
 
     Public APRS-IS requires an explicit geographic center and enforces a 500 km
-    maximum range. Operators running their own APRS-IS server may set
+    maximum range. APRS_IS_EXTRA_RANGES may add up to eight more circles with
+    the same limits. Operators running their own APRS-IS server may set
     APRS_IS_PRIVATE_SERVER=true; only then may APRS_IS_FILTER be arbitrary or
     blank. The private-server override is rejected for known public APRS hosts.
     """
@@ -127,8 +183,8 @@ def aprs_connection_config() -> APRSISConfig | None:
         if "\r" in filter_expr or "\n" in filter_expr:
             raise ValueError("APRS_IS_FILTER cannot contain line breaks")
     else:
-        lat, lon, radius = _parse_public_range()
-        filter_expr = f"r/{lat:.5f}/{lon:.5f}/{radius:g}"
+        ranges = [_parse_public_range(), *_parse_extra_public_ranges()]
+        filter_expr = " ".join(f"r/{lat:.5f}/{lon:.5f}/{radius:g}" for lat, lon, radius in ranges)
 
     callsign = (os.getenv("APRS_IS_CALLSIGN") or "N0CALL").strip().upper()
     if not _CALLSIGN_RE.fullmatch(callsign):
@@ -167,6 +223,9 @@ class APRSISBridge:
         self._config: APRSISConfig | None = None
         self._connected = False
         self._last_error = ""
+        # server address -> monotonic time it refused our login
+        self._refused: dict[str, float] = {}
+        self._login_accepted = False
 
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
@@ -261,16 +320,40 @@ class APRSISBridge:
 
     def _run(self) -> None:
         failures = 0
+        refusals = 0
         while not self._stop.is_set():
             config = self._config
             if config is None:
                 return
+            self._login_accepted = False
+            started = time.monotonic()
             try:
                 self._connect_and_read(config)
                 if self._stop.is_set():
                     return
+                if self._login_accepted and time.monotonic() - started >= _HEALTHY_SESSION_S:
+                    # A session that really worked: start the backoff over.
+                    failures = 0
+                    refusals = 0
                 failures += 1
                 self._last_error = "connection_closed"
+            except APRSLoginRefused as exc:
+                if self._stop.is_set():
+                    return
+                refusals += 1
+                self._last_error = f"login_refused: {exc}"
+                if refusals <= _MAX_REFUSALS_PER_ROUND:
+                    logger.info(
+                        "APRS-IS server %s refused the login; trying another server (%d/%d)",
+                        exc,
+                        refusals,
+                        _MAX_REFUSALS_PER_ROUND,
+                    )
+                    self._stop.wait(_REFUSAL_RETRY_S * random.uniform(0.8, 1.2))
+                    continue
+                # Too many refusals in a row: fall back to the normal backoff.
+                refusals = 0
+                failures += 1
             except Exception as exc:
                 if self._stop.is_set():
                     return
@@ -281,8 +364,40 @@ class APRSISBridge:
             logger.info("APRS-IS reconnect backoff %.0fs after %d failure(s)", delay, failures)
             self._stop.wait(delay)
 
+    def _candidate_servers(self, config: APRSISConfig) -> list[str]:
+        """Addresses behind the configured host, refusing ones last-resort only."""
+        try:
+            infos = socket.getaddrinfo(config.host, config.port, type=socket.SOCK_STREAM)
+        except OSError:
+            return [config.host]
+        addresses: list[str] = []
+        for info in infos:
+            address = str(info[4][0])
+            if address not in addresses:
+                addresses.append(address)
+        if not addresses:
+            return [config.host]
+        now = time.monotonic()
+        self._refused = {a: t for a, t in self._refused.items() if now - t < _REFUSED_SERVER_TTL_S}
+        usable = [a for a in addresses if a not in self._refused]
+        if not usable:
+            # Every known server refused within the last hour: start over.
+            self._refused.clear()
+            usable = addresses
+        random.shuffle(usable)
+        return usable
+
+    def _open_socket(self, config: APRSISConfig) -> tuple[socket.socket, str]:
+        last_error: OSError | None = None
+        for address in self._candidate_servers(config)[:3]:
+            try:
+                return socket.create_connection((address, config.port), timeout=30), address
+            except OSError as exc:
+                last_error = exc
+        raise last_error or OSError("no APRS-IS server address")
+
     def _connect_and_read(self, config: APRSISConfig) -> None:
-        sock = socket.create_connection((config.host, config.port), timeout=30)
+        sock, server = self._open_socket(config)
         with self._socket_lock:
             if self._stop.is_set():
                 sock.close()
@@ -308,7 +423,15 @@ class APRSISBridge:
                 while b"\n" in buf:
                     line_bytes, buf = buf.split(b"\n", 1)
                     line_bytes = line_bytes.strip()
-                    if not line_bytes or line_bytes.startswith(b"#"):
+                    if not line_bytes:
+                        continue
+                    if line_bytes.startswith(b"#"):
+                        lowered = line_bytes.lower()
+                        if any(marker in lowered for marker in _LOGIN_REFUSED_MARKERS):
+                            self._refused[server] = time.monotonic()
+                            raise APRSLoginRefused(server)
+                        if b"logresp" in lowered:
+                            self._login_accepted = True
                         continue
                     self._parse_packet(self._decode_line(line_bytes))
         finally:
